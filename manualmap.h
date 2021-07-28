@@ -4,10 +4,6 @@
 static_assert(0, "This manual mapping injector only works with Windows x86");
 #endif
 
-#ifndef _MSC_VER
-static_assert(0, "This manual mapping injector only works with the MSVC++ compiler");
-#endif
-
 #include <windows.h>
 
 enum class MANUALMAP_ERROR_CODE
