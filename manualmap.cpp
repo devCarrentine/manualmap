@@ -1,5 +1,11 @@
 #include "manualmap.h"
 
+#ifdef VMP_API
+#define MMAP_STRING(string) VMProtectDecryptStringA(string)
+#else
+#define MMAP_STRING(string) string
+#endif
+
 struct stLoaderParams
 {
 	::DWORD dwGetProcAddress;
@@ -106,6 +112,10 @@ MANUALMAP_ERROR_CODE WINAPI LibraryInitializationRemoteThread(::LPVOID lpThreadP
 
 bool manualmap::inject(::HANDLE targetProcess, ::LPBYTE staticBytecode, MANUALMAP_ERROR_HANDLER errorHandler)
 {
+#ifdef VMP_API
+	VMProtectBeginUltra("manualmap::inject");
+#endif
+
 	::HMODULE ntdllLibrary{::LoadLibraryA(MMAP_STRING("ntdll.dll"))};
 	if (!ntdllLibrary)
 	{
@@ -345,4 +355,8 @@ bool manualmap::inject(::HANDLE targetProcess, ::LPBYTE staticBytecode, MANUALMA
 	zwCloseHandle(threadHandle);
 
 	return true;
+
+#ifdef VMP_API
+	VMProtectEnd();
+#endif
 }

@@ -4,12 +4,6 @@
 static_assert(0, "This manual mapping injector only works with Windows x86");
 #endif
 
-#ifdef VMP_API
-#define MMAP_STRING(string) VMProtectDecryptStringA(string)
-#else
-#define MMAP_STRING(string) string
-#endif
-
 #include <windows.h>
 #include "winapi.h"
 
