@@ -4,7 +4,14 @@
 static_assert(0, "This manual mapping injector only works with Windows x86");
 #endif
 
+#ifdef VMP_API
+#define MMAP_STRING(string) VMProtectDecryptStringA(string)
+#else
+#define MMAP_STRING(string) string
+#endif
+
 #include <windows.h>
+#include "winapi.h"
 
 enum class MANUALMAP_ERROR_CODE
 {
@@ -28,11 +35,12 @@ enum class MANUALMAP_ERROR_CODE
 	REMOTE_THREAD_CREATION,
 	WAIT_FOR_SINGLE_OBJECT,
 	GET_EXIT_CODE_THREAD,
-	NTMODULE_DOES_NOT_EXIST
+	NTMODULE_DOES_NOT_EXIST,
+	NTMODULE_HAS_NO_FUNCTIONS
 };
 
 namespace manualmap
 {
-	using MANUALMAP_ERROR_HANDLER = void(*)(MANUALMAP_ERROR_CODE errorCode);
+	using MANUALMAP_ERROR_HANDLER = void(*)(MANUALMAP_ERROR_CODE errorCode, ::NTSTATUS ntError);
 	bool inject(::HANDLE targetProcess, ::LPBYTE libraryBytecode, MANUALMAP_ERROR_HANDLER errorHandler);
 }

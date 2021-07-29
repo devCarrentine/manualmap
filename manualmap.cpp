@@ -19,8 +19,8 @@ MANUALMAP_ERROR_CODE WINAPI LibraryInitializationRemoteThread(::LPVOID lpThreadP
 	auto dwLoadLibrary{loaderParams->dwLoadLibrary};
 	auto moduleBase{loaderParams->dwModuleBase};
 
-	auto getProcAddress{reinterpret_cast<decltype(&GetProcAddress)>(dwGetProcAddress)};
-	auto loadLibrary{reinterpret_cast<decltype(&LoadLibraryA)>(dwLoadLibrary)};
+	auto getProcAddress{reinterpret_cast<decltype(&::GetProcAddress)>(dwGetProcAddress)};
+	auto loadLibrary{reinterpret_cast<decltype(&::LoadLibraryA)>(dwLoadLibrary)};
 	
 	const ::DWORD dwDelta{moduleBase - loaderParams->imageNtHeader->OptionalHeader.ImageBase};
 	auto imageBaseRelocation{loaderParams->imageBaseRelocation};
@@ -106,18 +106,63 @@ MANUALMAP_ERROR_CODE WINAPI LibraryInitializationRemoteThread(::LPVOID lpThreadP
 
 bool manualmap::inject(::HANDLE targetProcess, ::LPBYTE staticBytecode, MANUALMAP_ERROR_HANDLER errorHandler)
 {
+	::HMODULE ntdllLibrary{::LoadLibraryA(MMAP_STRING("ntdll.dll"))};
+	if (!ntdllLibrary)
+	{
+		errorHandler(MANUALMAP_ERROR_CODE::NTMODULE_DOES_NOT_EXIST, NULL);
+		return false;
+	}
+
+	using ZwAllocateVirtualMemory_t = ::NTSTATUS(NTAPI *)(
+		::HANDLE, ::LPVOID *, ::ULONG_PTR, ::PSIZE_T, ::ULONG, ::ULONG);
+
+	using ZwFreeVirtualMemory_t = ::NTSTATUS(NTAPI *)(::HANDLE, ::LPVOID *, ::PSIZE_T, ::ULONG);
+	using NtCreateThreadEx_t = ::NTSTATUS(NTAPI *)(::PHANDLE, ::ACCESS_MASK, ::PVOID, ::HANDLE, 
+		::PVOID, ::PVOID, ::ULONG, ::SIZE_T, ::SIZE_T, ::SIZE_T, ::PVOID);
+
+	using ZwWaitForSingleObject_t = ::NTSTATUS(NTAPI *)(::HANDLE, ::BOOLEAN, ::PLARGE_INTEGER);
+
+	auto zwAllocateVirtualMemory{ZwAllocateVirtualMemory_t(
+		win32::getProcAddress(ntdllLibrary, MMAP_STRING("ZwAllocateVirtualMemory")))};
+
+	auto zwFreeVirtualMemory{ZwFreeVirtualMemory_t(
+		win32::getProcAddress(ntdllLibrary, MMAP_STRING("ZwFreeVirtualMemory")))};
+
+	auto ntCreateThreadEx{NtCreateThreadEx_t(
+		win32::getProcAddress(ntdllLibrary, MMAP_STRING("NtCreateThreadEx")))};
+
+	auto zwWriteVirtualMemory{decltype(&::WriteProcessMemory)(
+		win32::getProcAddress(ntdllLibrary, MMAP_STRING("ZwWriteVirtualMemory")))};
+
+	auto zwCloseHandle{decltype(&::CloseHandle)(
+		win32::getProcAddress(ntdllLibrary, MMAP_STRING("ZwClose")))};
+
+	auto zwWaitForSingleObject{ZwWaitForSingleObject_t(
+		win32::getProcAddress(ntdllLibrary, MMAP_STRING("ZwWaitForSingleObject")))};
+
+	if (nullptr == zwAllocateVirtualMemory ||
+		nullptr == zwFreeVirtualMemory ||
+		nullptr == zwWriteVirtualMemory ||
+		nullptr == ntCreateThreadEx ||
+		nullptr == zwCloseHandle ||
+		nullptr == zwWaitForSingleObject)
+	{
+		errorHandler(MANUALMAP_ERROR_CODE::NTMODULE_HAS_NO_FUNCTIONS, NULL);
+		return false;
+	}
+
 	::LPBYTE libraryBytecode{staticBytecode};
 
 	if (!libraryBytecode) 
 	{
-		errorHandler(MANUALMAP_ERROR_CODE::MODULE_DOES_NOT_EXIST);
+		errorHandler(MANUALMAP_ERROR_CODE::MODULE_DOES_NOT_EXIST, NULL);
 		return false;
 	}
 
 	auto imageDosHeader{reinterpret_cast<::PIMAGE_DOS_HEADER>(libraryBytecode)};
 	if (imageDosHeader->e_magic != 0x5A4D) 
 	{
-		errorHandler(MANUALMAP_ERROR_CODE::MODULE_UNKNOWN_ARCHITECTURE);
+		errorHandler(MANUALMAP_ERROR_CODE::MODULE_UNKNOWN_ARCHITECTURE, NULL);
 		return false;
 	}
 
@@ -127,20 +172,23 @@ bool manualmap::inject(::HANDLE targetProcess, ::LPBYTE staticBytecode, MANUALMA
 	::PIMAGE_OPTIONAL_HEADER imageOptionalHeader{&imageNtHeader->OptionalHeader};
 	::PIMAGE_FILE_HEADER imageFileHeader{&imageNtHeader->FileHeader};
 
-	::LPVOID imageVirtualMemory{::VirtualAllocEx(targetProcess, nullptr, 
-		imageOptionalHeader->SizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)};
+	::LPVOID imageVirtualMemory{nullptr};
+	::NTSTATUS ntError{zwAllocateVirtualMemory(targetProcess, &imageVirtualMemory, NULL,
+		&imageOptionalHeader->SizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)};
 
-	if (!imageVirtualMemory) 
+	if (!imageVirtualMemory || ntError)
 	{
-		errorHandler(MANUALMAP_ERROR_CODE::MODULE_VIRTUAL_MEMORY_ALLOCATION);
+		errorHandler(MANUALMAP_ERROR_CODE::MODULE_VIRTUAL_MEMORY_ALLOCATION, ntError);
 		return false;
 	}
 
-	if (!::WriteProcessMemory(targetProcess, imageVirtualMemory,
-		libraryBytecode, imageOptionalHeader->SizeOfHeaders, NULL))
+	ntError = zwWriteVirtualMemory(targetProcess, imageVirtualMemory,
+		libraryBytecode, imageOptionalHeader->SizeOfHeaders, NULL);
+
+	if (ntError)
 	{
-		errorHandler(MANUALMAP_ERROR_CODE::MODULE_VIRTUAL_MEMORY_INITIALIZATION);
-		::VirtualFreeEx(targetProcess, imageVirtualMemory, 0, MEM_RELEASE);
+		errorHandler(MANUALMAP_ERROR_CODE::MODULE_VIRTUAL_MEMORY_INITIALIZATION, ntError);
+		zwFreeVirtualMemory(targetProcess, &imageVirtualMemory, 0, MEM_RELEASE);
 
 		return false;
 	}
@@ -150,8 +198,8 @@ bool manualmap::inject(::HANDLE targetProcess, ::LPBYTE staticBytecode, MANUALMA
 	{
 		if (imageSectionHeader[i].SizeOfRawData)
 		{
-			const BOOL sectionWriteResult{
-				::WriteProcessMemory(targetProcess,
+			const ::NTSTATUS sectionWriteResult{
+				zwWriteVirtualMemory(targetProcess,
 					reinterpret_cast<::LPVOID>(
 						reinterpret_cast<::DWORD>(imageVirtualMemory) +
 						imageSectionHeader[i].VirtualAddress),
@@ -160,49 +208,54 @@ bool manualmap::inject(::HANDLE targetProcess, ::LPBYTE staticBytecode, MANUALMA
 						imageSectionHeader[i].PointerToRawData),
 					imageSectionHeader[i].SizeOfRawData, nullptr)};
 
-			if (FALSE == sectionWriteResult) 
+			if (sectionWriteResult) 
 			{
-				errorHandler(MANUALMAP_ERROR_CODE::MODULE_MAPPING_SECTION_INVALID);
-				::VirtualFreeEx(targetProcess, imageVirtualMemory, 0, MEM_RELEASE);
+				errorHandler(MANUALMAP_ERROR_CODE::MODULE_MAPPING_SECTION_INVALID, sectionWriteResult);
+				zwFreeVirtualMemory(targetProcess, &imageVirtualMemory, 0, MEM_RELEASE);
 
 				return false;
 			}
 		}
 	}
 
-	const ::SIZE_T oneVirtualPageSize{4096};
-	::LPVOID shellcodeVirtualMemory{::VirtualAllocEx(targetProcess, nullptr, 
-		oneVirtualPageSize, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)};
+	::SIZE_T oneVirtualPageSize{4096};
+	::LPVOID shellcodeVirtualMemory{nullptr};
+	ntError = zwAllocateVirtualMemory(targetProcess, &shellcodeVirtualMemory, NULL,
+		&oneVirtualPageSize, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
 
-	if (!shellcodeVirtualMemory) 
+	if (!shellcodeVirtualMemory || ntError)
 	{
-		errorHandler(MANUALMAP_ERROR_CODE::SHELLCODE_VIRTUAL_MEMORY_ALLOCATION);
-		::VirtualFreeEx(targetProcess, imageVirtualMemory, 0, MEM_RELEASE);
+		errorHandler(MANUALMAP_ERROR_CODE::SHELLCODE_VIRTUAL_MEMORY_ALLOCATION, ntError);
+		zwFreeVirtualMemory(targetProcess, &imageVirtualMemory, 0, MEM_RELEASE);
 
 		return false;
 	}
 
 	auto pairFree = [&]()
 	{
-		::VirtualFreeEx(targetProcess, imageVirtualMemory, 0, MEM_RELEASE);
-		::VirtualFreeEx(targetProcess, shellcodeVirtualMemory, 0, MEM_RELEASE);
+		zwFreeVirtualMemory(targetProcess, &imageVirtualMemory, 0, MEM_RELEASE);
+		zwFreeVirtualMemory(targetProcess, &shellcodeVirtualMemory, 0, MEM_RELEASE);
 	};
 
-	if (!::WriteProcessMemory(targetProcess, shellcodeVirtualMemory,
-		reinterpret_cast<::LPCVOID>(&LibraryInitializationRemoteThread), oneVirtualPageSize, nullptr))
+	ntError = zwWriteVirtualMemory(targetProcess, shellcodeVirtualMemory,
+		reinterpret_cast<::LPCVOID>(&LibraryInitializationRemoteThread), oneVirtualPageSize, nullptr);
+
+	if (ntError)
 	{
-		errorHandler(MANUALMAP_ERROR_CODE::SHELLCODE_VIRTUAL_MEMORY_INITIALIZATION);
+		errorHandler(MANUALMAP_ERROR_CODE::SHELLCODE_VIRTUAL_MEMORY_INITIALIZATION, ntError);
 		pairFree();
 
 		return false;
 	}
 
-	::LPVOID paramsVirtualMemory{::VirtualAllocEx(targetProcess, nullptr,
-		sizeof(stLoaderParams), MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)};
+	::SIZE_T loaderSize{sizeof(stLoaderParams)};
+	::LPVOID paramsVirtualMemory{nullptr};
+	ntError = zwAllocateVirtualMemory(targetProcess, &paramsVirtualMemory, NULL,
+		&loaderSize, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
 
-	if (!paramsVirtualMemory) 
+	if (!paramsVirtualMemory || ntError)
 	{
-		errorHandler(MANUALMAP_ERROR_CODE::PARAMS_VIRTUAL_MEMORY_ALLOCATION);
+		errorHandler(MANUALMAP_ERROR_CODE::PARAMS_VIRTUAL_MEMORY_ALLOCATION, ntError);
 		pairFree();
 
 		return false;
@@ -210,9 +263,9 @@ bool manualmap::inject(::HANDLE targetProcess, ::LPBYTE staticBytecode, MANUALMA
 
 	auto fullyFree = [&]()
 	{
-		::VirtualFreeEx(targetProcess, imageVirtualMemory, 0, MEM_RELEASE);
-		::VirtualFreeEx(targetProcess, shellcodeVirtualMemory, 0, MEM_RELEASE);
-		::VirtualFreeEx(targetProcess, paramsVirtualMemory, 0, MEM_RELEASE);
+		zwFreeVirtualMemory(targetProcess, &imageVirtualMemory, 0, MEM_RELEASE);
+		zwFreeVirtualMemory(targetProcess, &shellcodeVirtualMemory, 0, MEM_RELEASE);
+		zwFreeVirtualMemory(targetProcess, &paramsVirtualMemory, 0, MEM_RELEASE);
 	};
 
 	stLoaderParams loaderParams;
@@ -221,16 +274,7 @@ bool manualmap::inject(::HANDLE targetProcess, ::LPBYTE staticBytecode, MANUALMA
 	loaderParams.dwLoadLibrary = reinterpret_cast<::DWORD>(&::LoadLibraryA);
 	loaderParams.dwModuleBase = reinterpret_cast<::DWORD>(imageVirtualMemory);
 
-	::HMODULE ntdllLibrary{::LoadLibraryA("ntdll.dll")};
-	if (!ntdllLibrary) 
-	{
-		errorHandler(MANUALMAP_ERROR_CODE::NTMODULE_DOES_NOT_EXIST);
-		fullyFree();
-
-		return false;
-	}
-
-	loaderParams.dwRtlZeroMemory = ::DWORD(::GetProcAddress(ntdllLibrary, "RtlZeroMemory"));
+	loaderParams.dwRtlZeroMemory = ::DWORD(win32::getProcAddress(ntdllLibrary, MMAP_STRING("RtlZeroMemory")));
 
 	loaderParams.imageBaseRelocation = reinterpret_cast<::PIMAGE_BASE_RELOCATION>(
 		reinterpret_cast<::DWORD>(imageVirtualMemory) + 
@@ -243,59 +287,62 @@ bool manualmap::inject(::HANDLE targetProcess, ::LPBYTE staticBytecode, MANUALMA
 	loaderParams.imageNtHeader = reinterpret_cast<::PIMAGE_NT_HEADERS>(
 		reinterpret_cast<::DWORD>(imageVirtualMemory) + imageDosHeader->e_lfanew);
 
-	if (!::WriteProcessMemory(targetProcess, paramsVirtualMemory,
-		reinterpret_cast<::LPCVOID>(&loaderParams), sizeof(stLoaderParams), nullptr))
+	ntError = zwWriteVirtualMemory(targetProcess, paramsVirtualMemory,
+		reinterpret_cast<::LPCVOID>(&loaderParams), sizeof(stLoaderParams), nullptr);
+
+	if (ntError)
 	{
-		errorHandler(MANUALMAP_ERROR_CODE::PARAMS_VIRTUAL_MEMORY_INITIALIZATION);
+		errorHandler(MANUALMAP_ERROR_CODE::PARAMS_VIRTUAL_MEMORY_INITIALIZATION, ntError);
 		fullyFree();
 
 		return false;
 	}
 
-	const ::HANDLE threadHandle{::CreateRemoteThread(targetProcess, nullptr, 0,
-		reinterpret_cast<::LPTHREAD_START_ROUTINE>(shellcodeVirtualMemory), paramsVirtualMemory, 0, nullptr)};
+	::HANDLE threadHandle{NULL};
+	ntError = ntCreateThreadEx(&threadHandle, 0x1FFFFF, nullptr, targetProcess, 
+		shellcodeVirtualMemory, paramsVirtualMemory, NULL, NULL, NULL, NULL, nullptr);
 
-	if (INVALID_HANDLE_VALUE == threadHandle || !threadHandle)
+	if (INVALID_HANDLE_VALUE == threadHandle || !threadHandle || ntError)
 	{
-		errorHandler(MANUALMAP_ERROR_CODE::REMOTE_THREAD_CREATION);
+		errorHandler(MANUALMAP_ERROR_CODE::REMOTE_THREAD_CREATION, ntError);
 		fullyFree();
 
 		return false;
 	}
-
-	const ::DWORD waitCode{::WaitForSingleObject(threadHandle, INFINITE)};
-	if (WAIT_FAILED == waitCode) 
+	
+	ntError = zwWaitForSingleObject(threadHandle, FALSE, nullptr);
+	if (ntError)
 	{
-		errorHandler(MANUALMAP_ERROR_CODE::WAIT_FOR_SINGLE_OBJECT);
+		errorHandler(MANUALMAP_ERROR_CODE::WAIT_FOR_SINGLE_OBJECT, ntError);
 		fullyFree();
 
-		::CloseHandle(threadHandle);
+		zwCloseHandle(threadHandle);
 		return false;
 	}
 
 	::DWORD threadExitCode{EXIT_SUCCESS};
 	if (!::GetExitCodeThread(threadHandle, &threadExitCode))
 	{
-		errorHandler(MANUALMAP_ERROR_CODE::GET_EXIT_CODE_THREAD);
+		errorHandler(MANUALMAP_ERROR_CODE::GET_EXIT_CODE_THREAD, NULL);
 		fullyFree();
 
-		::CloseHandle(threadHandle);
+		zwCloseHandle(threadHandle);
 		return false;
 	}
 
 	if (EXIT_SUCCESS != threadExitCode)
 	{
-		errorHandler(MANUALMAP_ERROR_CODE(threadExitCode));
+		errorHandler(MANUALMAP_ERROR_CODE(threadExitCode), NULL);
 		fullyFree();
 
-		::CloseHandle(threadHandle);
+		zwCloseHandle(threadHandle);
 		return false;
 	}
 
-	::VirtualFreeEx(targetProcess, shellcodeVirtualMemory, 0, MEM_RELEASE);
-	::VirtualFreeEx(targetProcess, paramsVirtualMemory, 0, MEM_RELEASE);
+	zwFreeVirtualMemory(targetProcess, &shellcodeVirtualMemory, 0, MEM_RELEASE);
+	zwFreeVirtualMemory(targetProcess, &paramsVirtualMemory, 0, MEM_RELEASE);
 
-	::CloseHandle(threadHandle);
+	zwCloseHandle(threadHandle);
 
 	return true;
 }

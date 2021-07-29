@@ -23,9 +23,9 @@ void FindProcessHandle(::LPCSTR lpProcessName, ::HANDLE &processHandle)
 	::CloseHandle(tlhelpSnapshot);
 }
 
-void InjectLibraryErrorHandler(MANUALMAP_ERROR_CODE errorCode)
+void InjectLibraryErrorHandler(MANUALMAP_ERROR_CODE errorCode, ::NTSTATUS ntError)
 {
-	std::printf("The library load function returned an error code: %d\n", errorCode);
+	std::printf("The library load function returned an error code: %d; NTSTATUS: %d\n", errorCode, ntError);
 	std::printf("The GetLastError function returned an error code: %x\n", ::GetLastError());
 }
 
